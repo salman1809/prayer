@@ -1,11 +1,12 @@
 from flask import Flask, request, jsonify, render_template_string
-import sqlite3
 import random
 import requests
 import os
 import html
 from datetime import datetime
 from openpyxl import Workbook, load_workbook
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
@@ -13,8 +14,11 @@ app = Flask(__name__)
 # CONFIGURATION
 # ============================================================
 
-DATABASE = "calvary_prayer.db"
-EXCEL_FILE = "calvary_prayer_requests.xlsx"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+EXCEL_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "calvary_prayer_requests.xlsx"
+)
 
 BOTPRESS_WEBHOOK_URL = os.getenv(
     "BOTPRESS_WEBHOOK_URL",
@@ -38,82 +42,67 @@ sessions = {}
 
 
 # ============================================================
-# DATABASE
+# DATABASE - RENDER POSTGRESQL
 # ============================================================
 
 def get_db():
+    """Connect to Render PostgreSQL using DATABASE_URL."""
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not configured. "
+            "Create a PostgreSQL database on Render and add its Internal Database URL "
+            "to the Web Service environment variables."
+        )
 
-    conn = sqlite3.connect(DATABASE)
-
-    conn.row_factory = sqlite3.Row
-
-    return conn
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor
+    )
 
 
 def init_database():
-
     conn = get_db()
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS prayer_requests (
-
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
+            id SERIAL PRIMARY KEY,
             prayer_id TEXT UNIQUE NOT NULL,
-
             session_id TEXT,
-
             name TEXT NOT NULL,
-
             phone TEXT,
-
             language TEXT DEFAULT 'English',
-
             category TEXT NOT NULL,
-
             prayer_request TEXT NOT NULL,
-
             ai_response TEXT,
-
             phone_verified INTEGER DEFAULT 0,
-
             status TEXT DEFAULT 'New',
-
             created_at TEXT NOT NULL
-
         )
     """)
 
     conn.commit()
-
     conn.close()
 
 
-init_database()
-
 def migrate_database():
-    """Add new columns to older databases without deleting existing data."""
+    """Add columns needed by the application to an older PostgreSQL database."""
     conn = get_db()
-    columns = [
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(prayer_requests)").fetchall()
-    ]
 
-    if "language" not in columns:
-        conn.execute(
-            "ALTER TABLE prayer_requests ADD COLUMN language TEXT DEFAULT 'English'"
-        )
+    conn.execute("""
+        ALTER TABLE prayer_requests
+        ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'English'
+    """)
 
     conn.commit()
     conn.close()
 
 
+init_database()
 migrate_database()
 
 
-
 # ============================================================
-# EXCEL STORAGE
+# EXCEL BACKUP / EXPORT
 # ============================================================
 
 EXCEL_HEADERS = [
@@ -132,17 +121,19 @@ EXCEL_HEADERS = [
 
 
 def get_excel_workbook():
-    """Create or open the Excel workbook."""
     if os.path.exists(EXCEL_FILE):
         wb = load_workbook(EXCEL_FILE)
-        ws = wb["Prayer Requests"] if "Prayer Requests" in wb.sheetnames else wb.active
+        ws = (
+            wb["Prayer Requests"]
+            if "Prayer Requests" in wb.sheetnames
+            else wb.active
+        )
     else:
         wb = Workbook()
         ws = wb.active
         ws.title = "Prayer Requests"
         ws.append(EXCEL_HEADERS)
 
-    # Repair an existing empty worksheet.
     if ws.max_row == 1 and all(cell.value is None for cell in ws[1]):
         ws.delete_rows(1, 1)
         ws.append(EXCEL_HEADERS)
@@ -150,25 +141,7 @@ def get_excel_workbook():
     return wb, ws
 
 
-def save_prayer_to_excel(prayer):
-    """Insert a new prayer request into Excel."""
-    wb, ws = get_excel_workbook()
-
-    ws.append([
-        prayer.get("prayer_id", ""),
-        prayer.get("session_id", ""),
-        prayer.get("name", ""),
-        prayer.get("phone", ""),
-        prayer.get("language", "English"),
-        prayer.get("category", ""),
-        prayer.get("prayer_request", ""),
-        prayer.get("ai_response", ""),
-        prayer.get("phone_verified", 0),
-        prayer.get("status", "New"),
-        prayer.get("created_at", "")
-    ])
-
-    # Basic formatting.
+def format_excel(ws):
     for cell in ws[1]:
         cell.font = cell.font.copy(bold=True)
 
@@ -176,43 +149,69 @@ def save_prayer_to_excel(prayer):
     ws.auto_filter.ref = ws.dimensions
 
     widths = {
-        "A": 16, "B": 38, "C": 22, "D": 18, "E": 12,
-        "F": 18, "G": 50, "H": 65, "I": 16, "J": 25, "K": 22
+        "A": 16,
+        "B": 38,
+        "C": 22,
+        "D": 18,
+        "E": 12,
+        "F": 18,
+        "G": 50,
+        "H": 65,
+        "I": 16,
+        "J": 25,
+        "K": 22
     }
+
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
 
-    wb.save(EXCEL_FILE)
-    wb.close()
+
+def save_prayer_to_excel(prayer):
+    """Create/update one row in the local Excel backup."""
+    try:
+        wb, ws = get_excel_workbook()
+
+        prayer_id = str(prayer.get("prayer_id", ""))
+
+        # Update existing row if present.
+        existing_row = None
+        for row_number in range(2, ws.max_row + 1):
+            if str(ws.cell(row_number, 1).value) == prayer_id:
+                existing_row = row_number
+                break
+
+        values = [
+            prayer.get("prayer_id", ""),
+            prayer.get("session_id", ""),
+            prayer.get("name", ""),
+            prayer.get("phone", ""),
+            prayer.get("language", "English"),
+            prayer.get("category", ""),
+            prayer.get("prayer_request", ""),
+            prayer.get("ai_response", ""),
+            prayer.get("phone_verified", 0),
+            prayer.get("status", "New"),
+            prayer.get("created_at", "")
+        ]
+
+        if existing_row:
+            for column_number, value in enumerate(values, start=1):
+                ws.cell(existing_row, column_number).value = value
+        else:
+            ws.append(values)
+
+        format_excel(ws)
+        wb.save(EXCEL_FILE)
+        wb.close()
+
+        print("Excel saved:", EXCEL_FILE)
+
+    except Exception as error:
+        print("Excel save error:", error)
 
 
-def update_prayer_in_excel(prayer_id, phone, phone_verified, status):
-    """Update the existing Excel row after OTP verification."""
-    if not os.path.exists(EXCEL_FILE):
-        return False
-
-    wb, ws = get_excel_workbook()
-
-    prayer_id_column = 1
-
-    for row in range(2, ws.max_row + 1):
-        if str(ws.cell(row=row, column=prayer_id_column).value) == str(prayer_id):
-            # Phone = column D (4)
-            ws.cell(row=row, column=4).value = phone
-
-            # Phone Verified = column I (9)
-            ws.cell(row=row, column=9).value = phone_verified
-
-            # Status = column J (10)
-            ws.cell(row=row, column=10).value = status
-
-            wb.save(EXCEL_FILE)
-            wb.close()
-            return True
-
-    wb.close()
-    return False
-
+def update_prayer_in_excel(prayer):
+    save_prayer_to_excel(prayer)
 
 
 # ============================================================
@@ -1757,7 +1756,7 @@ def create_prayer():
             created_at
         )
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
 
         (
@@ -1788,10 +1787,9 @@ def create_prayer():
 
 
     conn.commit()
-
     conn.close()
 
-    # Save the same prayer request to Excel.
+    # Save a copy to Excel.
     save_prayer_to_excel({
         "prayer_id": prayer_id,
         "session_id": session_id,
@@ -2056,7 +2054,7 @@ def verify_otp():
             phone_verified = 1,
             status = 'Prayer Call Requested'
 
-        WHERE prayer_id = ?
+        WHERE prayer_id = %s
         """,
 
         (
@@ -2069,13 +2067,26 @@ def verify_otp():
 
     conn.commit()
 
+    # Update the same Excel row after phone verification.
+    row_for_excel = conn.execute(
+        """
+        SELECT *
+        FROM prayer_requests
+        WHERE prayer_id = %s
+        """,
+        (prayer_id,)
+    ).fetchone()
+
+    if row_for_excel:
+        save_prayer_to_excel(dict(row_for_excel))
+
 
     row =conn.execute(
 
             """
             SELECT *
             FROM prayer_requests
-            WHERE prayer_id = ?
+            WHERE prayer_id = %s
             """,
 
             (
@@ -2258,6 +2269,83 @@ def send_to_zapier(
             "Zapier error:",
             error
         )
+
+
+# ============================================================
+# DOWNLOAD EXCEL
+# ============================================================
+
+@app.route("/download-excel")
+def download_excel():
+    """Generate a fresh Excel file from PostgreSQL and download it."""
+    try:
+        conn = get_db()
+
+        rows = conn.execute("""
+            SELECT
+                prayer_id,
+                session_id,
+                name,
+                phone,
+                language,
+                category,
+                prayer_request,
+                ai_response,
+                phone_verified,
+                status,
+                created_at
+            FROM prayer_requests
+            ORDER BY id DESC
+        """).fetchall()
+
+        conn.close()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Prayer Requests"
+        ws.append(EXCEL_HEADERS)
+
+        for row in rows:
+            row = dict(row)
+            ws.append([
+                row.get("prayer_id", ""),
+                row.get("session_id", ""),
+                row.get("name", ""),
+                row.get("phone", ""),
+                row.get("language", "English"),
+                row.get("category", ""),
+                row.get("prayer_request", ""),
+                row.get("ai_response", ""),
+                row.get("phone_verified", 0),
+                row.get("status", "New"),
+                row.get("created_at", "")
+            ])
+
+        format_excel(ws)
+
+        export_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "calvary_prayer_requests_export.xlsx"
+        )
+
+        wb.save(export_path)
+        wb.close()
+
+        from flask import send_file
+
+        return send_file(
+            export_path,
+            as_attachment=True,
+            download_name="calvary_prayer_requests.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except Exception as error:
+        print("Excel download error:", error)
+        return jsonify({
+            "success": False,
+            "message": str(error)
+        }), 500
 
 
 # ============================================================
@@ -2559,6 +2647,31 @@ tr:hover {{
     Prayer Requests
 </div>
 
+<p style="margin:15px 0;">
+    <a href="/download-excel"
+       style="display:inline-block;
+              padding:12px 18px;
+              background:#754722;
+              color:white;
+              border-radius:10px;
+              text-decoration:none;
+              font-weight:bold;">
+        📊 Download Excel
+    </a>
+    <a href="/api/prayer-requests"
+       style="display:inline-block;
+              padding:12px 18px;
+              margin-left:8px;
+              background:#fff;
+              color:#754722;
+              border:1px solid #d9c7b1;
+              border-radius:10px;
+              text-decoration:none;
+              font-weight:bold;">
+        View API Data
+    </a>
+</p>
+
 <div class="card">
 
 <table>
@@ -2708,7 +2821,10 @@ def health():
             "running",
 
         "database":
-            DATABASE,
+            "PostgreSQL",
+
+        "database_configured":
+            bool(DATABASE_URL),
 
         "excel_file":
             EXCEL_FILE,
@@ -2736,64 +2852,27 @@ def health():
 # RUN
 # ============================================================
 
+
+# ============================================================
+# RUN
+# ============================================================
+
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
 
     print()
-    print(
-        "=========================================="
-    )
-    print(
-        "🙏 CALVARY TEMPLE PRAYER AI"
-    )
-    print(
-        "=========================================="
-    )
+    print("==========================================")
+    print("🙏 CALVARY TEMPLE PRAYER AI")
+    print("==========================================")
     print()
-    print(
-        "Prayer AI:"
-    )
-    print(
-        "http://127.0.0.1:5000"
-    )
-    print()
-    print(
-        "Prayer Team Dashboard:"
-    )
-    print(
-        "http://127.0.0.1:5000/dashboard"
-    )
-    print()
-    print(
-        "Database:"
-    )
-    print(
-        "calvary_prayer.db"
-    )
-    print()
-    print(
-        "Excel:"
-    )
-    print(
-        "calvary_prayer_requests.xlsx"
-    )
-    print()
-    print(
-        "=========================================="
-    )
-
+    print("Port:", port)
+    print("Database: Render PostgreSQL")
+    print("Dashboard: /dashboard")
+    print("Excel Download: /download-excel")
+    print("==========================================")
 
     app.run(
-
-        host="127.0.0.1",
-
-        port=5000,
-
-        debug=True
-
+        host="0.0.0.0",
+        port=port,
+        debug=False
     )
-
-
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
