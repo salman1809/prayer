@@ -12,7 +12,8 @@ from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
 
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 
 
@@ -28,10 +29,7 @@ app = Flask(__name__)
 
 
 
-DATABASE_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "calvary_temple.db"
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 EXCEL_FILE = os.path.join(
 
@@ -86,22 +84,34 @@ sessions = {}
 
 
 # ============================================================
-# DATABASE - LOCAL SQLITE
+# DATABASE - RENDER POSTGRESQL
 # ============================================================
 
 def get_db():
-    """Open the local SQLite database."""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+    """Connect to Render PostgreSQL using DATABASE_URL."""
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not configured. Add the Render PostgreSQL "
+            "Internal Database URL to the Web Service environment variables."
+        )
+    class DatabaseConnection:
+        def __init__(self, conn):
+            self.conn = conn
+        def execute(self, query, params=None):
+            cur = self.conn.cursor()
+            cur.execute(query, params or ())
+            return cur
+        def commit(self):
+            self.conn.commit()
+        def close(self):
+            self.conn.close()
+    return DatabaseConnection(psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor))
 
 def init_database():
-    """Create the prayer_requests table if it does not exist."""
     conn = get_db()
-    conn.execute("""
+    cur = conn.execute("""
         CREATE TABLE IF NOT EXISTS prayer_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             prayer_id TEXT UNIQUE NOT NULL,
             session_id TEXT,
             name TEXT NOT NULL,
@@ -116,26 +126,24 @@ def init_database():
         )
     """)
     conn.commit()
+    if cur:
+        cur.close()
     conn.close()
-
 
 def migrate_database():
-    """Safely add columns if an older local database is found."""
     conn = get_db()
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(prayer_requests)").fetchall()}
-    if "language" not in columns:
-        conn.execute("ALTER TABLE prayer_requests ADD COLUMN language TEXT DEFAULT 'English'")
-    if "phone" not in columns:
-        conn.execute("ALTER TABLE prayer_requests ADD COLUMN phone TEXT DEFAULT ''")
-    if "ai_response" not in columns:
-        conn.execute("ALTER TABLE prayer_requests ADD COLUMN ai_response TEXT")
-    if "phone_verified" not in columns:
-        conn.execute("ALTER TABLE prayer_requests ADD COLUMN phone_verified INTEGER DEFAULT 0")
-    if "status" not in columns:
-        conn.execute("ALTER TABLE prayer_requests ADD COLUMN status TEXT DEFAULT 'New'")
+    cur = None
+    for statement in [
+        "ALTER TABLE prayer_requests ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'English'",
+        "ALTER TABLE prayer_requests ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''",
+        "ALTER TABLE prayer_requests ADD COLUMN IF NOT EXISTS ai_response TEXT",
+        "ALTER TABLE prayer_requests ADD COLUMN IF NOT EXISTS phone_verified INTEGER DEFAULT 0",
+        "ALTER TABLE prayer_requests ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'New'"
+    ]:
+        cur = conn.execute(statement)
     conn.commit()
+    cur.close()
     conn.close()
-
 
 init_database()
 migrate_database()
@@ -3451,7 +3459,7 @@ def create_prayer():
 
 
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 
         """,
 
@@ -4039,7 +4047,7 @@ def verify_otp():
 
         SET
 
-            phone = ?,
+            phone = %s,
 
             phone_verified = 1,
 
@@ -4047,7 +4055,7 @@ def verify_otp():
 
 
 
-        WHERE prayer_id = ?
+        WHERE prayer_id = %s
 
         """,
 
@@ -4083,7 +4091,7 @@ def verify_otp():
 
         FROM prayer_requests
 
-        WHERE prayer_id = ?
+        WHERE prayer_id = %s
 
         """,
 
@@ -4111,7 +4119,7 @@ def verify_otp():
 
             FROM prayer_requests
 
-            WHERE prayer_id = ?
+            WHERE prayer_id = %s
 
             """,
 
@@ -4807,18 +4815,6 @@ def dashboard():
 
                 {html.escape(
 
-                    row["language"] or "English"
-
-                )}
-
-            </td>
-
-
-
-            <td>
-
-                {html.escape(
-
                     row["category"]
 
                 )}
@@ -4834,14 +4830,6 @@ def dashboard():
                     row["prayer_request"]
 
                 )}
-
-            </td>
-
-
-
-            <td>
-
-                {verified}
 
             </td>
 
@@ -4866,18 +4854,6 @@ def dashboard():
                 </span>
 
 
-
-            </td>
-
-
-
-            <td>
-
-                {html.escape(
-
-                    row["created_at"]
-
-                )}
 
             </td>
 
@@ -5073,7 +5049,7 @@ table {{
 
 
 
-    min-width: 1200px;
+    min-width: 900px;
 
 }}
 
@@ -5325,14 +5301,6 @@ Phone
 
 <th>
 
-Language
-
-</th>
-
-
-
-<th>
-
 Category
 
 </th>
@@ -5349,23 +5317,7 @@ Prayer Request
 
 <th>
 
-Phone
-
-</th>
-
-
-
-<th>
-
 Status
-
-</th>
-
-
-
-<th>
-
-Created
 
 </th>
 
@@ -5587,7 +5539,7 @@ def health():
 
         "database_configured":
 
-            bool(DATABASE_FILE),
+            bool(DATABASE_URL),
 
 
 
